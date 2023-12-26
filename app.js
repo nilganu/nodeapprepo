@@ -11,11 +11,11 @@ app.use(bodyParser.json());
 
 const myCache = new NodeCache();
 
-const redisClient = redis.createClient({
-  url: 'redis://localhost:6379'
-});
-redisClient.on('error', (err) => console.log('Redis Client Error', err));
-redisClient.connect();
+// const redisClient = redis.createClient({
+//   url: 'redis://localhost:6379'
+// });
+// redisClient.on('error', (err) => console.log('Redis Client Error', err));
+// redisClient.connect();
 
 
 let refreshToken = ''; 
