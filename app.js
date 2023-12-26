@@ -208,15 +208,8 @@ app.post('/api/calculate-markup', async (req, res) => {
 });
 
 function findCompanyMarkup(rules) {
-  for (const key in rules) {
-    if (rules.hasOwnProperty(key)) {
-      const rule = rules[key].meta;
-      if (rule.agentid === "1") {
-        return rule;
-      }
-    }
-  }
-  return null;
+  return Object.values(rules).find(ruleData => ruleData.meta.agentid === "1")?.meta || null;
+
 }
 
 
