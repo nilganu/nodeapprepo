@@ -4,25 +4,15 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const NodeCache = require('node-cache');
-const redis = require('redis');
 
 const app = express();
 app.use(bodyParser.json());
 
 const myCache = new NodeCache();
-
-// const redisClient = redis.createClient({
-//   url: 'redis://localhost:6379'
-// });
-// redisClient.on('error', (err) => console.log('Redis Client Error', err));
-// redisClient.connect();
-
-
 let refreshToken = ''; 
 
-async function refreshCache() {
+function refreshCache() {
   myCache.del("readData");
- // await redisClient.del("readData");
 }
 
 
@@ -65,18 +55,6 @@ async function refreshAccessToken() {
   }
 }
 
-// Set data in Redis
-async function setCache(key, value, ttl) {
-  await redisClient.set(key, JSON.stringify(value), {
-    EX: ttl
-  });
-}
-
-// Get data from Redis
-async function getCache(key) {
-  const data = await redisClient.get(key);
-  return data ? JSON.parse(data) : null;
-}
 
 app.post('/api/send-data', async (req, res) => {
     let accessToken;
@@ -119,8 +97,7 @@ app.post('/api/send-data', async (req, res) => {
   
   app.post('/api/read-data', async (req, res) => {
     const cachedData = myCache.get("readData");
-   //const cachedData = await getCache("readData");
-   if (cachedData) {
+    if (cachedData) {
         return res.send(cachedData);
     }
     let accessToken;
@@ -144,7 +121,6 @@ app.post('/api/send-data', async (req, res) => {
         });
 
         myCache.set("readData", response.data, 100000); // Cache the response data for 10000 seconds
-        //await setCache("readData", response.data, 10000);
         res.send(response.data);
     } catch (error) {
         if (error.response && error.response.status === 401) {
@@ -166,16 +142,22 @@ app.post('/api/send-data', async (req, res) => {
 
 
 app.post('/api/calculate-markup', async (req, res) => {
-  const { bookingDate, checkInDate, serviceType, location, rulecontactid, agentid, supplierid1, price, pax, night, unit } = req.body;
+  const requests = req.body;
 
-  let finalPrice = price;
-  let accessToken;
+  // Convert each request into a promise and process them in parallel
+  const promises = requests.map(request => processMarkupCalculation(request));
 
   try {
-    accessToken = await getAccessToken();
+    // Wait for all promises to resolve
+    const results = await Promise.all(promises);
+    res.json(results);
   } catch (error) {
-    return res.status(500).send('Error obtaining access token');
+    console.error('Error processing requests:', error);
+    res.status(500).send('Error processing requests');
   }
+});
+async function processMarkupCalculation(request) {
+  const { bookingDate, checkInDate, serviceType, location, rulecontactid, agentid, supplierid1, price, pax, night, unit } = request;
 
   try {
     const rulesData = myCache.get('readData');
@@ -184,124 +166,163 @@ app.post('/api/calculate-markup', async (req, res) => {
     }
 
     const { bestAgentRule, bestSupplierRule } = findMatchingRules(bookingDate, checkInDate, serviceType, location, rulecontactid, agentid, supplierid1, rulesData.data);
+    let finalPrice = price;
 
     if (bestSupplierRule) {
-      finalPrice = applyMarkup(finalPrice, bestSupplierRule.markupvalue, bestSupplierRule.markuptype, bestSupplierRule.percentagetype, bestSupplierRule.calculationmethodcode, pax, night, unit);
+      finalPrice = applyMarkup(finalPrice, parseFloat(bestSupplierRule.markupvalue), bestSupplierRule.markuptype, bestSupplierRule.percentagetype, bestSupplierRule.calculationmethodcode, pax, night, unit);
     }
 
     if (!bestAgentRule || bestAgentRule.ignorecompanymarkup !== 'Yes') {
       const companyMarkup = findCompanyMarkup(rulesData.data);
       if (companyMarkup) {
-        finalPrice = applyMarkup(finalPrice, companyMarkup.markupvalue, companyMarkup.markuptype, companyMarkup.percentagetype, companyMarkup.calculationMethodCode, pax, night, unit);
+        finalPrice = applyMarkup(finalPrice, parseFloat(companyMarkup.markupvalue), companyMarkup.markuptype, companyMarkup.percentagetype, companyMarkup.calculationMethodCode, pax, night, unit);
       }
     }
 
     if (bestAgentRule) {
-      finalPrice = applyMarkup(finalPrice, bestAgentRule.markupvalue, bestAgentRule.markuptype, bestAgentRule.percentagetype, bestAgentRule.calculationmethodcode, pax, night, unit);
+      finalPrice = applyMarkup(finalPrice, parseFloat(bestAgentRule.markupvalue), bestAgentRule.markuptype, bestAgentRule.percentagetype, bestAgentRule.calculationmethodcode, pax, night, unit);
     }
 
-    res.json({ originalPrice: price, finalPrice });
+    return { originalPrice: price, finalPrice };
   } catch (error) {
-    console.error('Error in /api/calculate-markup:', error);
-    res.status(500).send('Internal Server Error');
+    console.error('Error in processMarkupCalculation:', error);
+    return { error: 'Internal Server Error', details: error.message };
   }
-});
+}
 
 function findCompanyMarkup(rules) {
-  return Object.values(rules).find(ruleData => ruleData.meta.agentid === "1")?.meta || null;
-
+  for (const key in rules) {
+    if (rules.hasOwnProperty(key)) {
+      const rule = rules[key].meta;
+      if (rule.agentid === "1") {
+        return rule;
+      }
+    }
+  }
+  return null;
 }
 
 
 function applyMarkup(price, markupValue, markuptype, percentagetype, calculationMethodCode, pax, night, unit) {
-  const markupFloat = parseFloat(markupValue);
+  markupValue = parseFloat(markupValue);
 
   if (markuptype === 'p') {
-    return applyPercentageMarkup(price, markupFloat, percentagetype);
+    // Percentage markup or margin
+    if (percentagetype === 'MG') {
+      // Margin
+      console.log("Margin",parseFloat((price * 100 / (100 - markupValue)).toFixed(2)));
+      return parseFloat((price * 100 / (100 - markupValue)).toFixed(2));
+    } else {
+      // Markup
+      console.log("Markup",parseFloat((price * (1 + markupValue / 100)).toFixed(2)));
+      return parseFloat((price * (1 + markupValue / 100)).toFixed(2));
+    }
   } else if (markuptype === 'f') {
-    return applyFixedMarkup(price, markupFloat, calculationMethodCode, pax, night, unit);
-  }
-  return price;  // Unknown markup type, return the original price
-}
-
-function applyPercentageMarkup(price, markupValue, percentagetype) {
-  if (percentagetype === 'MG') {
-    // Margin
-    return parseFloat((price * 100 / (100 - markupValue)).toFixed(2));
+    // Fixed markup
+    
+    let additionalCost = 0;
+    switch (calculationMethodCode) {
+      case 'PPPN': // Per Person Per Night
+       
+        additionalCost = markupValue * pax * night;
+        console.log("ffff",additionalCost);
+        break;
+      case 'PPPB': // Per Person Per Booking
+        additionalCost = markupValue * pax;
+        break;
+      case 'PUPN': // Per Unit Per Night
+        additionalCost = markupValue * night * unit;
+        break;
+      case 'PUPB': // Per Unit Per Booking
+        additionalCost = markupValue * unit;
+        break;
+    }
+    return price + additionalCost;
   } else {
-    // Markup
-    return parseFloat((price * (1 + markupValue / 100)).toFixed(2));
+    // Unknown markup type, return the original price
+    return price;
   }
 }
 
-function applyFixedMarkup(price, markupValue, calculationMethodCode, pax, night, unit) {
-  let additionalCost = 0;
-  switch (calculationMethodCode) {
-    case 'PPPN': // Per Person Per Night
-      additionalCost = markupValue * pax * night;
-      break;
-    case 'PPPB': // Per Person Per Booking
-      additionalCost = markupValue * pax;
-      break;
-    case 'PUPN': // Per Unit Per Night
-      additionalCost = markupValue * night * unit;
-      break;
-    case 'PUPB': // Per Unit Per Booking
-      additionalCost = markupValue * unit;
-      break;
-  }
-  return price + additionalCost;
-}
-
-function findMatchingRules(bookingDate, checkInDate, serviceType, location, rulecontactid1, agentId, supplierID, rules) {
+function findMatchingRules(bookingDate, checkInDate, serviceType, location, rulecontactid1,agentId,supplierID, rules) {
   let bestAgentRule = null;
   let bestSupplierRule = null;
   let highestAgentPriority = Number.MAX_SAFE_INTEGER;
   let highestSupplierPriority = Number.MAX_SAFE_INTEGER;
+  let highestAgentContentId = -1;
+  let highestSupplierContentId = -1;
 
-  const parsedBookingDate = new Date(bookingDate).getTime();
-  const parsedCheckInDate = new Date(checkInDate).getTime();
+  for (const key in rules) {
+    if (rules.hasOwnProperty(key)) {
+      const rule = rules[key].meta;
+      const contentId = parseInt(rules[key].content_id);
+      const rulePriority = parseInt(rule.priority);
 
-  Object.values(rules).forEach(ruleData => {
-    const rule = ruleData.meta;
-    const contentId = parseInt(ruleData.content_id);
+      // Check if bookingdaterange and checkindaterange are defined
+      if (!rule.bookingdaterange || !rule.checkindaterange) {
+        continue; // Skip this rule if either range is not defined
+      }
 
-    if (!isDateInRange(parsedBookingDate, rule.bookingdaterange) || !isDateInRange(parsedCheckInDate, rule.checkindaterange)) {
-      return; // Skip if date not in range
-    }
+      const ruleServiceType = rule.servicetype;
+      const ruleLocation = rule.locationname;
+      const ruleContactType = rule.rulecontacttype;
+      const ruleContactId = rule.rulecontactid;
+      const agentIdList = rule.agentid ? rule.agentid.split(',') : [];
+      const supplierIdList = rule.supplierid1 ? rule.supplierid1.split(',') : [];
+      const bookingDateRange = rule.bookingdaterange.split(' - ');
+      const checkInDateRange = rule.checkindaterange.split(' - ');
+      console.log(ruleContactType,"-",ruleContactId);
 
-    if (rule.servicetype !== serviceType || rule.locationname !== location) {
-      return; // Skip if service type or location doesn't match
-    }
+      if (isDateInRange(bookingDate, bookingDateRange) &&
+          isDateInRange(checkInDate, checkInDateRange) &&
+          ruleServiceType === serviceType &&
+          ruleLocation === location) {
+        
+        // Check for agent rules
+        console.log(supplierID);
+        console.log(ruleContactType === 'AG',ruleContactId === rulecontactid1,rulePriority <= highestAgentPriority);
+        if (ruleContactType === 'AG' && (ruleContactId === rulecontactid1) && rulePriority <= highestAgentPriority) {
+          if ((supplierIdList.length === 0 || supplierIdList.includes(supplierID)) && (rulePriority < highestAgentPriority || contentId > highestAgentContentId)) {
+            highestAgentPriority = rulePriority;
+            highestAgentContentId = contentId;
+            bestAgentRule = rule;
+          }
+        }
 
-    if (rule.rulecontacttype === 'AG' && rule.rulecontactid === rulecontactid1) {
-      if (!supplierID || rule.supplierid1.split(',').includes(supplierID)) {
-        if (parseInt(rule.priority) < highestAgentPriority || (parseInt(rule.priority) === highestAgentPriority && contentId > highestAgentContentId)) {
-          highestAgentPriority = parseInt(rule.priority);
-          bestAgentRule = rule;
+        // Check for supplier rules
+        if (ruleContactType === 'SP' && (ruleContactId === rulecontactid1) && rulePriority <= highestSupplierPriority) {
+          if ((agentIdList.length === 0 || agentIdList.includes(agentId)) && (rulePriority < highestSupplierPriority || contentId > highestSupplierContentId)) {
+            highestSupplierPriority = rulePriority;
+            highestSupplierContentId = contentId;
+            bestSupplierRule = rule;
+          }
         }
       }
     }
+  }
 
-    if (rule.rulecontacttype === 'SP' && rule.rulecontactid === rulecontactid1) {
-      if (!agentId || rule.agentid.split(',').includes(agentId)) {
-        if (parseInt(rule.priority) < highestSupplierPriority || (parseInt(rule.priority) === highestSupplierPriority && contentId > highestSupplierContentId)) {
-          highestSupplierPriority = parseInt(rule.priority);
-          bestSupplierRule = rule;
-        }
-      }
-    }
-  });
-
+  console.log("Agent Rule", bestAgentRule);
+  console.log("Supplier Rule", bestSupplierRule);
   return { bestAgentRule, bestSupplierRule };
 }
 
-function isDateInRange(dateTimestamp, range) {
-  const [startDate, endDate] = range.split(' - ').map(d => new Date(d).getTime());
-  return dateTimestamp >= startDate && dateTimestamp <= endDate;
+function isDateInRange(date, range) {
+  const dateTimestamp = new Date(date).getTime();
+  const startTimestamp = new Date(range[0]).getTime();
+  const endTimestamp = new Date(range[1]).getTime();
+
+  return dateTimestamp >= startTimestamp && dateTimestamp <= endTimestamp;
 }
 
 
+
+function isDateInRange(date, range) {
+  const dateTimestamp = new Date(date).getTime();
+  const startTimestamp = new Date(range[0]).getTime();
+  const endTimestamp = new Date(range[1]).getTime();
+
+  return dateTimestamp >= startTimestamp && dateTimestamp <= endTimestamp;
+}
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
